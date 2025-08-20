@@ -172,6 +172,13 @@ async function startStream(streamId, resumePosition = null) {
     const startTime = new Date();
     streamStartTimes.set(streamId, startTime);
     
+    // Initialize or update base resume position so subsequent restarts are cumulative
+    if (resumePosition && resumePosition > 0) {
+      streamVideoPositions.set(streamId, resumePosition);
+    } else if (!streamVideoPositions.has(streamId)) {
+      streamVideoPositions.set(streamId, 0);
+    }
+    
     // Update stream status
     await Stream.updateStatus(streamId, 'live', stream.user_id);
 
@@ -358,17 +365,22 @@ async function handleStreamError(streamId, code, signal) {
 }
 
 function calculateResumePosition(streamId) {
+  const basePosition = streamVideoPositions.get(streamId) || 0;
   const startTime = streamStartTimes.get(streamId);
-  if (!startTime) return 0;
+  if (!startTime) {
+    addStreamLog(streamId, `No start time found. Using base resume position: ${basePosition}s`);
+    return basePosition;
+  }
   
   const now = new Date();
-  const elapsedSeconds = Math.floor((now - startTime) / 1000);
+  const elapsedSeconds = Math.max(0, Math.floor((now - startTime) / 1000));
+  const resumePosition = basePosition + elapsedSeconds;
   
-  // Store the calculated position for this stream
-  streamVideoPositions.set(streamId, elapsedSeconds);
+  // Persist cumulative position for next restart
+  streamVideoPositions.set(streamId, resumePosition);
   
-  addStreamLog(streamId, `Calculated resume position: ${elapsedSeconds}s (elapsed time)`);
-  return elapsedSeconds;
+  addStreamLog(streamId, `Calculated resume position: base=${basePosition}s + elapsed=${elapsedSeconds}s => ${resumePosition}s`);
+  return resumePosition;
 }
 
 async function stopStream(streamId) {
