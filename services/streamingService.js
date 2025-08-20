@@ -37,11 +37,7 @@ const STABLE_FFMPEG_OPTIONS = [
   '-re',
   '-fflags', '+genpts+igndts+discardcorrupt',
   '-avoid_negative_ts', 'make_zero',
-  '-max_muxing_queue_size', '1024',
-  '-rtmp_live', 'live',
-  '-rtmp_buffer', '5000',
-  '-rtmp_conn', 'attempts=3',
-  '-rtmp_timeout', '30'
+  '-max_muxing_queue_size', '1024'
 ];
 
 // Initialize health monitor reference
@@ -603,4 +599,4 @@ module.exports = {
   cleanupStreamData,
   setHealthMonitor
 };
-schedulerService.init(module.exports);
+// Scheduler is initialized once from the application entrypoint to avoid double timers
