@@ -36,8 +36,7 @@ const STABLE_FFMPEG_OPTIONS = [
   '-loglevel', 'error',
   '-re',
   '-fflags', '+genpts+igndts+discardcorrupt',
-  '-avoid_negative_ts', 'make_zero',
-  '-max_muxing_queue_size', '1024'
+  '-avoid_negative_ts', 'make_zero'
 ];
 
 // Initialize health monitor reference
