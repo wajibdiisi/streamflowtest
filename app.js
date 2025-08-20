@@ -967,6 +967,12 @@ app.get('/stream/:videoId', isAuthenticated, async (req, res) => {
 app.get('/api/settings/gdrive-status', isAuthenticated, async (req, res) => {
   try {
     const user = await User.findById(req.session.userId);
+    if (!user) {
+      return res.json({
+        hasApiKey: false,
+        message: 'User not found'
+      });
+    }
     res.json({
       hasApiKey: !!user.gdrive_api_key,
       message: user.gdrive_api_key ? 'Google Drive API key is configured' : 'No Google Drive API key found'
@@ -1012,7 +1018,7 @@ app.post('/api/videos/import-drive', isAuthenticated, [
     }
     const { driveUrl } = req.body;
     const user = await User.findById(req.session.userId);
-    if (!user.gdrive_api_key) {
+    if (!user || !user.gdrive_api_key) {
       return res.status(400).json({
         success: false,
         error: 'Google Drive API key is not configured'
