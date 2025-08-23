@@ -1,19 +1,13 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+const ffmpegConfig = require('../utils/ffmpegConfig');
 const schedulerService = require('./schedulerService');
 const { v4: uuidv4 } = require('uuid');
 const { db } = require('../db/database');
 
-let ffmpegPath;
-if (fs.existsSync('/usr/bin/ffmpeg')) {
-  ffmpegPath = '/usr/bin/ffmpeg';
-  console.log('Using system FFmpeg at:', ffmpegPath);
-} else {
-  ffmpegPath = ffmpegInstaller.path;
-  console.log('Using bundled FFmpeg at:', ffmpegPath);
-}
+// Use FFmpeg path from config
+const ffmpegPath = ffmpegConfig.ffmpegPath;
 
 const Stream = require('../models/Stream');
 const Video = require('../models/Video');
@@ -26,18 +20,10 @@ const streamLogs = new Map();
 const streamRetryCount = new Map();
 const streamStartTimes = new Map(); // Track when each stream started
 const streamVideoPositions = new Map(); // Track video position for each stream
+const streamBasePositions = new Map(); // Track base position for cumulative restarts
 const MAX_RETRY_ATTEMPTS = 3;
 const manuallyStoppingStreams = new Set();
 const MAX_LOG_LINES = 100;
-
-// Enhanced FFmpeg options for better stability
-const STABLE_FFMPEG_OPTIONS = [
-  '-hwaccel', 'none',
-  '-loglevel', 'error',
-  '-re',
-  '-fflags', '+genpts+igndts+discardcorrupt',
-  '-avoid_negative_ts', 'make_zero'
-];
 
 // Initialize health monitor reference
 function setHealthMonitor(healthMonitor) {
@@ -80,72 +66,31 @@ async function buildFFmpegArgs(stream, resumePosition = null) {
 
   const rtmpUrl = `${stream.rtmp_url.replace(/\/$/, '')}/${stream.stream_key}`;
   
-  // Base arguments with enhanced stability options
-  let args = [...STABLE_FFMPEG_OPTIONS];
+  // Use the new FFmpeg configuration
+  const options = {
+    resumePosition: resumePosition || 0,
+    bitrate: stream.bitrate || '2500k',
+    resolution: stream.resolution || '1280x720',
+    fps: stream.fps || 30,
+    loopVideo: stream.loop_video || false,
+    useAdvancedSettings: stream.use_advanced_settings || false
+  };
 
-  // Add resume position if available
-  if (resumePosition && resumePosition > 0) {
-    args.push('-ss', resumePosition.toString());
-    addStreamLog(stream.id, `Resuming stream from position: ${resumePosition}s`);
-  }
-
-  // Add loop options
-  if (stream.loop_video) {
-    args.push('-stream_loop', '-1');
-  } else {
-    args.push('-stream_loop', '0');
-  }
-
-  // Add input file
-  args.push('-i', videoPath);
-
-  if (!stream.use_advanced_settings) {
-    // Simple copy mode with enhanced stability
-    args.push(
-      '-c:v', 'copy',
-      '-c:a', 'copy',
-      '-f', 'flv',
-      rtmpUrl
-    );
-  } else {
-    // Advanced encoding mode with enhanced stability
-    const resolution = stream.resolution || '1280x720';
-    const bitrate = stream.bitrate || 2500;
-    const fps = stream.fps || 30;
-    
-    args.push(
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-tune', 'zerolatency',
-      '-b:v', `${bitrate}k`,
-      '-maxrate', `${bitrate * 1.5}k`,
-      '-bufsize', `${bitrate * 2}k`,
-      '-pix_fmt', 'yuv420p',
-      '-g', '60',
-      '-s', resolution,
-      '-r', fps.toString(),
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-ar', '44100',
-      '-f', 'flv',
-      rtmpUrl
-    );
-  }
-
-  return args;
+  const ffmpegArgs = ffmpegConfig.buildFFmpegArgs(videoPath, rtmpUrl, options);
+  
+  // Log the command for debugging
+  addStreamLog(stream.id, `Built FFmpeg args: ${ffmpegArgs.join(' ')}`);
+  
+  return ffmpegArgs;
 }
 
 async function startStream(streamId, resumePosition = null) {
   try {
-    // Reset retry count only if this is a fresh start
+    // Reset retry count when starting fresh
     if (!resumePosition) {
-      streamRetryCount.set(streamId, 0);
+      streamRetryCount.delete(streamId);
     }
-
-    if (activeStreams.has(streamId)) {
-      return { success: false, error: 'Stream is already active' };
-    }
-
+    
     const stream = await Stream.findById(streamId);
     if (!stream) {
       return { success: false, error: 'Stream not found' };
@@ -175,8 +120,12 @@ async function startStream(streamId, resumePosition = null) {
     // Initialize or update base resume position so subsequent restarts are cumulative
     if (resumePosition && resumePosition > 0) {
       streamVideoPositions.set(streamId, resumePosition);
+      streamBasePositions.set(streamId, resumePosition);
+      addStreamLog(streamId, `Set base resume position to: ${resumePosition}s`);
     } else if (!streamVideoPositions.has(streamId)) {
       streamVideoPositions.set(streamId, 0);
+      streamBasePositions.set(streamId, 0);
+      addStreamLog(streamId, `Initialized base resume position to: 0s`);
     }
     
     // Update stream status
@@ -202,8 +151,10 @@ async function startStream(streamId, resumePosition = null) {
         }
         
         // Check for specific error conditions
-        if (message.includes('Broken pipe') || message.includes('Connection refused')) {
+        if (message.includes('Broken pipe') || message.includes('Connection refused') || 
+            message.includes('Network is unreachable') || message.includes('No route to host')) {
           addStreamLog(streamId, `Network error detected: ${message}`);
+          // Don't restart immediately for network errors, let the exit handler deal with it
         }
       }
     });
@@ -338,21 +289,34 @@ async function handleStreamError(streamId, code, signal) {
     // Calculate resume position based on how long the stream was running
     const resumePosition = calculateResumePosition(streamId);
     
+    // Add exponential backoff for network-related errors
+    const backoffDelay = Math.min(3000 * Math.pow(2, retryCount - 1), 30000); // Max 30 seconds
+    
+    addStreamLog(streamId, `Scheduling restart in ${backoffDelay}ms with resume position: ${resumePosition}s`);
+    
     setTimeout(async () => {
       try {
         const streamInfo = await Stream.findById(streamId);
         if (streamInfo) {
+          addStreamLog(streamId, `Attempting restart #${retryCount + 1}...`);
           const result = await startStream(streamId, resumePosition);
           if (!result.success) {
             console.error(`[StreamingService] Failed to restart stream: ${result.error}`);
+            addStreamLog(streamId, `Restart failed: ${result.error}`);
             await Stream.updateStatus(streamId, 'offline');
+          } else {
+            addStreamLog(streamId, `Restart successful, resumed from position: ${resumePosition}s`);
           }
+        } else {
+          console.error(`[StreamingService] Cannot restart stream ${streamId}: not found in database`);
+          addStreamLog(streamId, `Cannot restart: stream not found in database`);
         }
       } catch (error) {
         console.error(`[StreamingService] Error during stream restart: ${error.message}`);
+        addStreamLog(streamId, `Restart error: ${error.message}`);
         await Stream.updateStatus(streamId, 'offline');
       }
-    }, 3000);
+    }, backoffDelay);
   } else {
     console.error(`[StreamingService] Maximum retry attempts (${MAX_RETRY_ATTEMPTS}) reached for stream ${streamId}`);
     addStreamLog(streamId, `Maximum retry attempts (${MAX_RETRY_ATTEMPTS}) reached, stopping stream`);
@@ -365,8 +329,9 @@ async function handleStreamError(streamId, code, signal) {
 }
 
 function calculateResumePosition(streamId) {
-  const basePosition = streamVideoPositions.get(streamId) || 0;
+  const basePosition = streamBasePositions.get(streamId) || 0;
   const startTime = streamStartTimes.get(streamId);
+  
   if (!startTime) {
     addStreamLog(streamId, `No start time found. Using base resume position: ${basePosition}s`);
     return basePosition;
@@ -376,7 +341,7 @@ function calculateResumePosition(streamId) {
   const elapsedSeconds = Math.max(0, Math.floor((now - startTime) / 1000));
   const resumePosition = basePosition + elapsedSeconds;
   
-  // Persist cumulative position for next restart
+  // Update current position for this instance
   streamVideoPositions.set(streamId, resumePosition);
   
   addStreamLog(streamId, `Calculated resume position: base=${basePosition}s + elapsed=${elapsedSeconds}s => ${resumePosition}s`);
@@ -441,6 +406,7 @@ function cleanupStreamData(streamId) {
   // Clean up all tracking data for this stream
   streamStartTimes.delete(streamId);
   streamVideoPositions.delete(streamId);
+  streamBasePositions.delete(streamId);
   streamRetryCount.delete(streamId);
   streamLogs.delete(streamId);
   
@@ -564,6 +530,10 @@ function getStreamVideoPosition(streamId) {
   return streamVideoPositions.get(streamId) || 0;
 }
 
+function getStreamBasePosition(streamId) {
+  return streamBasePositions.get(streamId) || 0;
+}
+
 function getStreamStartTime(streamId) {
   return streamStartTimes.get(streamId);
 }
@@ -581,6 +551,7 @@ function getStreamStatus(streamId) {
   const isActive = activeStreams.has(streamId);
   const startTime = streamStartTimes.get(streamId);
   const videoPosition = streamVideoPositions.get(streamId);
+  const basePosition = streamBasePositions.get(streamId);
   const retryCount = streamRetryCount.get(streamId) || 0;
   const logs = streamLogs.get(streamId) || [];
   
@@ -589,11 +560,102 @@ function getStreamStatus(streamId) {
     startTime: startTime ? startTime.toISOString() : null,
     elapsedTime: startTime ? getStreamElapsedTime(streamId) : 0,
     videoPosition,
+    basePosition,
     retryCount,
     logCount: logs.length,
     lastLog: logs.length > 0 ? logs[logs.length - 1] : null
   };
 }
+
+// Function to check if a stream needs recovery
+async function checkStreamHealth(streamId) {
+  const stream = await Stream.findById(streamId);
+  if (!stream) return false;
+  
+  const isActive = activeStreams.has(streamId);
+  const retryCount = streamRetryCount.get(streamId) || 0;
+  
+  // If stream is marked as live in DB but not active in memory, it needs recovery
+  if (stream.status === 'live' && !isActive && retryCount < MAX_RETRY_ATTEMPTS) {
+    addStreamLog(streamId, `Stream health check: stream marked as live but not active, attempting recovery`);
+    console.log(`[StreamingService] Health check: Stream ${streamId} needs recovery`);
+    
+    // Calculate resume position
+    const resumePosition = calculateResumePosition(streamId);
+    
+    // Attempt recovery
+    setTimeout(async () => {
+      try {
+        const result = await startStream(streamId, resumePosition);
+        if (result.success) {
+          addStreamLog(streamId, `Health check recovery successful`);
+          console.log(`[StreamingService] Health check recovery successful for stream ${streamId}`);
+        } else {
+          addStreamLog(streamId, `Health check recovery failed: ${result.error}`);
+          console.error(`[StreamingService] Health check recovery failed for stream ${streamId}: ${result.error}`);
+        }
+      } catch (error) {
+        addStreamLog(streamId, `Health check recovery error: ${error.message}`);
+        console.error(`[StreamingService] Health check recovery error for stream ${streamId}: ${error.message}`);
+      }
+    }, 5000); // Wait 5 seconds before attempting recovery
+    
+    return true;
+  }
+  
+  return false;
+}
+
+// Enhanced sync function with health checks
+async function syncStreamStatuses() {
+  try {
+    console.log('[StreamingService] Syncing stream statuses...');
+    const liveStreams = await Stream.findAll(null, 'live');
+    
+    for (const stream of liveStreams) {
+      const isReallyActive = activeStreams.has(stream.id);
+      if (!isReallyActive) {
+        console.log(`[StreamingService] Found inconsistent stream ${stream.id}: marked as 'live' in DB but not active in memory`);
+        
+        // Check if this stream can be recovered
+        const needsRecovery = await checkStreamHealth(stream.id);
+        
+        if (!needsRecovery) {
+          await Stream.updateStatus(stream.id, 'offline');
+          console.log(`[StreamingService] Updated stream ${stream.id} status to 'offline'`);
+        }
+      }
+    }
+    
+    const activeStreamIds = Array.from(activeStreams.keys());
+    for (const streamId of activeStreamIds) {
+      const stream = await Stream.findById(streamId);
+      if (!stream || stream.status !== 'live') {
+        console.log(`[StreamingService] Found inconsistent stream ${streamId}: active in memory but not 'live' in DB`);
+        if (stream) {
+          await Stream.updateStatus(streamId, 'live');
+          console.log(`[StreamingService] Updated stream ${streamId} status to 'live'`);
+        } else {
+          console.log(`[StreamingService] Stream ${streamId} not found in DB, removing from active streams`);
+          const process = activeStreams.get(streamId);
+          if (process) {
+            try {
+              process.kill('SIGTERM');
+            } catch (error) {
+              console.error(`[StreamingService] Error killing orphaned process: ${error.message}`);
+            }
+          }
+          activeStreams.delete(streamId);
+        }
+      }
+    }
+    console.log(`[StreamingService] Stream status sync completed. Active streams: ${activeStreamIds.length}`);
+  } catch (error) {
+    console.error('[StreamingService] Error syncing stream statuses:', error);
+  }
+}
+
+setInterval(syncStreamStatuses, 5 * 60 * 1000);
 
 module.exports = {
   startStream,
@@ -604,9 +666,11 @@ module.exports = {
   syncStreamStatuses,
   saveStreamHistory,
   getStreamVideoPosition,
+  getStreamBasePosition,
   getStreamStartTime,
   getStreamElapsedTime,
   getStreamStatus,
+  checkStreamHealth,
   cleanupStreamData,
   setHealthMonitor
 };
